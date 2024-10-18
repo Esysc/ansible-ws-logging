@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ansible Logs</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .row {
+            flex: 1; /* Allow the row to grow and fill the available space */
+        }
+        .col {
+            height: 100%; /* Make columns take full height */
+            padding: 10px; /* Padding for the columns */
+        }
+        .file-list {
+            max-height: 600px; /* Set a max height for the file list */
+            max-width: 30%;
+            overflow-y: auto; /* Enable vertical scrolling */
+            border: 1px solid #ddd; /* Border for the file list */
+            border-radius: 5px; /* Rounded corners */
+        }
+        .log-content {
+            max-height: 800px; /* Set a max height for the log content */
+            overflow-y: auto; /* Enable vertical scrolling */
+            border: 1px solid #ddd; /* Border for the content area */
+            border-radius: 5px; /* Rounded corners */
+            padding: 10px; /* Padding for the content area */
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <h1 class="text-center mb-4">Ansible Logs</h1>
+        <div class="row">
+            <div class="col file-list">
+                <h3>Log Files</h3>
+                <div id="fileList" class="list-group"></div>
+            </div>
+            <div class="col log-content">
+                <h3>Log Content</h3>
+                <div id="loading" class="text-center" style="display: none;">
+                    <div class="spinner-border" role="status">
+                        <span class="sr-only">Loading...</span>
+                    </div>
+                </div>
+                <pre id="logOutput" class="border rounded p-2"></pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap and jQuery JS -->
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.9.2/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
+    <script>
+        const fileList = document.getElementById('fileList');
+        const logOutput = document.getElementById('logOutput');
+        const socket = io();
+
+        socket.on('file_list', (files) => {
+            fileList.innerHTML = ''; // Clear the file list
+            files.forEach(file => {
+                const fileDiv = document.createElement('a');
+                fileDiv.className = 'text-left btn btn-info';
+                fileDiv.textContent = file.name;
+                fileDiv.onclick = () => {
+                    logOutput.textContent = ''; // Clear previous content
+                    document.getElementById('loading').style.display = 'block'; // Show loading
+                    socket.emit('get_file_content', { name: file.name }); // Request file content
+                };
+                fileList.appendChild(fileDiv);
+            });
+        });
+
+        socket.on('file_content', (data) => {
+            // Split the content into lines, reverse the order, and join back into a string
+            const reversedContent = data.content.split('\n').reverse().join('\n');
+            logOutput.textContent = `Log from ${data.name}:\n${reversedContent}`; // Display reversed log content
+            document.getElementById('loading').style.display = 'none'; // Hide loading
+        });
+
+        socket.on('connect_error', (error) => {
+            alert('Connection error: ' + error.message);
+        });
+
+        socket.on('file_content_error', (error) => {
+            logOutput.textContent = 'Error loading file content: ' + error.message;
+            document.getElementById('loading').style.display = 'none'; // Hide loading
+        });
+    </script>
+</body>
+</html>
