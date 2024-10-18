@@ -45,6 +45,7 @@
             </div>
             <div class="col log-content">
                 <h3>Log Content</h3>
+                <input type="text" id="searchInput" class="form-control mb-3" placeholder="Search log content...">
                 <div id="loading" class="text-center" style="display: none;">
                     <div class="spinner-border" role="status">
                         <span class="sr-only">Loading...</span>
@@ -63,7 +64,9 @@
     <script>
         const fileList = document.getElementById('fileList');
         const logOutput = document.getElementById('logOutput');
+        const searchInput = document.getElementById('searchInput');
         const socket = io();
+        let currentLogContent = ''; // Store the current log content for searching
 
         socket.on('file_list', (files) => {
             fileList.innerHTML = ''; // Clear the file list
@@ -83,6 +86,7 @@
         socket.on('file_content', (data) => {
             // Split the content into lines, reverse the order, and join back into a string
             const reversedContent = data.content.split('\n').reverse().join('\n');
+            currentLogContent = reversedContent; // Store the current log content
             logOutput.textContent = `Log from ${data.name}:\n${reversedContent}`; // Display reversed log content
             document.getElementById('loading').style.display = 'none'; // Hide loading
         });
@@ -94,6 +98,11 @@
         socket.on('file_content_error', (error) => {
             logOutput.textContent = 'Error loading file content: ' + error.message;
             document.getElementById('loading').style.display = 'none'; // Hide loading
+        });
+        searchInput.addEventListener('input', () => {
+            const query = searchInput.value.toLowerCase(); // Get the search query
+            const filteredLines = currentLogContent.split('\n').filter(line => line.toLowerCase().includes(query)); // Filter lines
+            logOutput.textContent = filteredLines.join('\n'); // Update the displayed log content
         });
     </script>
 </body>
