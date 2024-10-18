@@ -67,7 +67,7 @@
 
         socket.on('file_list', (files) => {
             fileList.innerHTML = ''; // Clear the file list
-            files.forEach(file => {
+            files.reverse().forEach(file => {
                 const fileDiv = document.createElement('a');
                 fileDiv.className = 'text-left btn btn-info';
                 fileDiv.textContent = file.name;
