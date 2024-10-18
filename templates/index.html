@@ -28,6 +28,11 @@
             border-radius: 5px; /* Rounded corners */
             padding: 10px; /* Padding for the content area */
         }
+        pre {
+            max-width: 100%;      /* Sets a maximum width */
+            white-space: pre-wrap; /* Preserves whitespace and wraps text */
+            overflow: hidden;      /* Hides any overflow */
+        }
     </style>
 </head>
 <body>
@@ -45,7 +50,7 @@
                         <span class="sr-only">Loading...</span>
                     </div>
                 </div>
-                <pre id="logOutput" class="border rounded p-2"></pre>
+                <pre id="logOutput" class="border rounded p-2">Choose a log file</pre>
             </div>
         </div>
     </div>
