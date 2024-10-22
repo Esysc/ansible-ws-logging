@@ -35,7 +35,7 @@ pip install -r requirements.txt
 ```bash
 python app.py
 ```
-2. **Open your web browser and navigate to**: http://localhost:5000
+2. **Open your web browser and navigate to**: `http://<hostname>:5000`
 
 **NOTE**: the root Ansible logs directory is set to `/var/log/ansible`, change it following your path or change the ansible.cfg configuration.
 
