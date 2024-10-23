@@ -2,6 +2,7 @@ from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import gzip
 import os
 import time
 
@@ -54,7 +55,7 @@ def index():
 def get_log_files():
     log_files = []
     for filename in os.listdir(LOGS_DIRECTORY):
-        if filename.endswith('.log'):
+        if filename.endswith('.log') or filename.endswith('.gz'):
             log_files.append({'name': filename})
     return log_files
 
@@ -67,8 +68,12 @@ def handle_connect():
 def handle_get_file_content(data):
     filename = data['name']
     filepath = os.path.join(LOGS_DIRECTORY, filename)
-    with open(filepath, 'r') as file:
-        content = file.read()
+    try:
+        with open(filepath, 'r') as file:
+            content = file.read()
+    except:
+        with gzip.open(filepath, 'rt') as file:
+            content = file.read()
     emit('file_content', {'name': filename, 'content': content})
 
 if __name__ == '__main__':
