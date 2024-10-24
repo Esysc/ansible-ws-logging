@@ -75,14 +75,31 @@
         socket.on('file_list', (files) => {
             fileList.innerHTML = ''; // Clear the file list
             files.reverse().forEach(file => {
-                const fileDiv = document.createElement('a');
+                const fileDiv = document.createElement('div');
                 fileDiv.className = 'text-left btn btn-info';
-                fileDiv.textContent = file.name;
-                fileDiv.onclick = () => {
+                const downloadButton = document.createElement('i');
+                downloadButton.className = 'bi bi-cloud-download';
+                downloadButton.setAttribute('data-filename', file.name)
+                downloadButton.setAttribute('title', 'Download')
+                const fileLink = document.createElement('a');
+                fileLink.textContent = ` ${file.name}`;
+                downloadButton.onclick = () => {
+                    if (logOutput.textContent.length > 100) {
+                        const downloadLink = document.createElement('a')
+                        downloadLink.setAttribute('download', file.name);
+                        downloadLink.setAttribute('href','data:text/plain;charset=utf-8, ' + encodeURIComponent(logOutput.textContent));
+                        downloadLink.click();
+                    } else {
+                        alert("the file is too small or not yet selected")
+                    }
+                };
+                fileLink.onclick = () => {
                     logOutput.textContent = ''; // Clear previous content
                     document.getElementById('loading').style.display = 'block'; // Show loading
                     socket.emit('get_file_content', { name: file.name }); // Request file content
                 };
+                fileDiv.appendChild(downloadButton);
+                fileDiv.appendChild(fileLink);
                 fileList.appendChild(fileDiv);
             });
         });
