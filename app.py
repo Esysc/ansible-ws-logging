@@ -36,6 +36,7 @@ class LogFileHandler(FileSystemEventHandler):
         # Emit the updated list of log files to all connected clients
         socketio.emit('file_list', log_files)
 
+
 def monitor_logs():
     observer = Observer()
     event_handler = LogFileHandler()
@@ -48,9 +49,11 @@ def monitor_logs():
         observer.stop()
     observer.join()
 
+
 @app.route('/')
 def index():
     return render_template('index.html')
+
 
 def get_log_files():
     log_files = []
@@ -59,10 +62,12 @@ def get_log_files():
             log_files.append({'name': filename})
     return log_files
 
+
 @socketio.on('connect')
 def handle_connect():
     log_files = get_log_files()
     emit('file_list', log_files)
+
 
 @socketio.on('get_file_content')
 def handle_get_file_content(data):
@@ -72,9 +77,11 @@ def handle_get_file_content(data):
         with open(filepath, 'r') as file:
             content = file.read()
     except:
+        # Open the file with gzip library, keeping text (default to buffer)
         with gzip.open(filepath, 'rt') as file:
             content = file.read()
     emit('file_content', {'name': filename, 'content': content})
+
 
 if __name__ == '__main__':
     # Start the log monitoring in a separate thread
