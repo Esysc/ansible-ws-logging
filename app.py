@@ -16,7 +16,7 @@ existing_files = set(os.listdir(LOGS_DIRECTORY))
 
 class LogFileHandler(FileSystemEventHandler):
     def on_created(self, event):
-        if event.src_path.endswith('.log'):
+        if event.src_path.endswith('.log') or event.src_path.endswith('.gz'):
             self.emit_log_files()
 
     def on_modified(self, event):
@@ -28,7 +28,7 @@ class LogFileHandler(FileSystemEventHandler):
             socketio.emit('file_content', {'name': filename, 'content': content})
 
     def on_deleted(self, event):
-        if event.src_path.endswith('.log'):
+        if event.src_path.endswith('.log') or event.src_path.endswith('.gz'):
             self.emit_log_files()
 
     def emit_log_files(self):
