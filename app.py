@@ -5,6 +5,7 @@ from watchdog.events import FileSystemEventHandler
 import gzip
 import os
 import time
+import glob
 
 app = Flask(__name__)
 socketio = SocketIO(app)
@@ -57,9 +58,11 @@ def index():
 
 def get_log_files():
     log_files = []
-    for filename in os.listdir(LOGS_DIRECTORY):
-        if filename.endswith('.log') or filename.endswith('.gz'):
-            log_files.append({'name': filename})
+    files = list(filter(os.path.isfile, glob.glob(f"{LOGS_DIRECTORY}/*")))
+    files.sort(key=os.path.getctime)
+    for f in files:
+        if f.endswith('.log') or f.endswith('.gz'):
+            log_files.append({'name': os.path.basename(f)})
     return log_files
 
 
