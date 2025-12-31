@@ -1,5 +1,7 @@
 # Real-Time Ansible Logs Viewer 🔍
 
+<img width="1303" height="777" alt="image" src="https://github.com/user-attachments/assets/21730993-d0a2-4a52-910e-431b94f5c969" />
+
 A small Flask + Flask-SocketIO app that streams Ansible logs in
 real time to connected web clients.
 
