@@ -1,1 +1,51 @@
-**env
+# Common ignores for Python projects
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+tests/.venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Mypy / Pyright caches
+.mypy_cache/
+.pyright/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+*.log
+*.pid
+
+# Secrets / env
+.env
+.env.*
+
+# Other
+.tox/
+*.pem
