@@ -42,98 +42,30 @@
         mode: "0755"
 
     - name: Populate sample logs with multiple realistic files
-      ansible.builtin.shell: |
-        {{ python }} - <<'PY'
-        import gzip, time, os
-        d = "{{ playbook_dir }}/sample_logs"
-        os.makedirs(d, exist_ok=True)
-        now = int(time.time())
-
-        def write(name, lines):
-            p = os.path.join(d, name)
-            with open(p, "w", encoding="utf-8") as f:
-                for i in range(lines):
-                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now+i))} - {name} - log line {i}\n")
-
-        # Main logs
-        write("ansible.log", 200)
-        write("access.log", 500)
-        write("errors.log", 100)
-
-        # gzipped older log
-        gzpath = os.path.join(d, "old.log.gz")
-        with gzip.open(gzpath, "wb") as f:
-            for i in range(300):
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now+i))} - old.log - entry {i}\n".encode())
-
-        # rotated / archived logs
-        for i in range(6):
-            write(f"app.{i}.log", 50)
-
-        print("created")
-        PY
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/python {{ playbook_dir }}/scripts/populate_sample_logs.py {{ playbook_dir }}/sample_logs"
+      args:
+        chdir: "{{ playbook_dir }}"
       tags:
         - populate_logs
 
-    - name: Write a small background log writer script
-      ansible.builtin.copy:
-        dest: "{{ playbook_dir }}/log_writer.py"
-        mode: '0755'
-        content: |
-          #!/usr/bin/env python3
+    - name: Ensure background log writer script exists in scripts dir
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/scripts/log_writer.py"
+      register: log_writer_script
+      tags:
+        - populate_logs
 
-          import glob
-          import os
-          import signal
-          import sys
-          import time
-          from typing import Any, Dict
-
-          LOG_DIR = os.path.join(os.path.dirname(__file__), "sample_logs")
-          os.makedirs(LOG_DIR, exist_ok=True)
-          PATH = os.path.join(LOG_DIR, "ansible.log")
-          INTERVAL = int(os.environ.get("LOG_WRITER_INTERVAL", "2"))
-
-          counters: Dict[str, int] = {}
-
-          i = 0  # fallback counter
-
-
-          def _handle(signum: int, frame: Any) -> None:
-              sys.exit(0)
-
-
-          signal.signal(signal.SIGTERM, _handle)
-          signal.signal(signal.SIGINT, _handle)
-
-          while True:
-              try:
-                  ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                  files = sorted(glob.glob(os.path.join(LOG_DIR, "*.log")))
-                  if not files:
-                      files = [PATH]
-
-                  for p in files:
-                      c = counters.setdefault(p, 0)
-                      line = f"{ts} - {os.path.basename(p)} - appended line {c}\n"
-                      with open(p, "a", encoding="utf-8") as f:
-                          f.write(line)
-                          f.flush()
-                      counters[p] = c + 1
-
-                  time.sleep(INTERVAL)
-              except Exception as e:
-                  with open(
-                      os.path.join(os.path.dirname(__file__), "log_writer.err"), "a"
-                  ) as errf:
-                      errf.write(str(e) + "\n")
-                  time.sleep(1)
+    - name: Fail if log writer script missing
+      ansible.builtin.fail:
+        msg: "log_writer.py not found in {{ playbook_dir }}/scripts"
+      when: not log_writer_script.stat.exists
       tags:
         - populate_logs
 
     - name: Start background log writer (appends lines every few seconds)
       ansible.builtin.shell: |
-        LOG_WRITER_INTERVAL={{ log_writer_interval }} nohup {{ venv_dir }}/bin/python "{{ playbook_dir }}/log_writer.py" > "{{ playbook_dir }}/log_writer.log" 2>&1 & echo $! > "{{ playbook_dir }}/log_writer.pid"
+        LOG_DIR='{{ playbook_dir }}/sample_logs' LOG_WRITER_INTERVAL={{ log_writer_interval }} nohup {{ venv_dir }}/bin/python "{{ playbook_dir }}/scripts/log_writer.py" > "{{ playbook_dir }}/log_writer.log" 2>&1 & echo $! > "{{ playbook_dir }}/log_writer.pid"
       args:
         chdir: "{{ playbook_dir }}"
       tags:
@@ -183,23 +115,12 @@
         msg: "{{ log_growth_check.stdout }}"
 
     - name: Find an available port (5500..5519)
-      ansible.builtin.shell: |
-        {{ venv_dir }}/bin/python - <<'PY'
-        import socket, sys
-        for p in range(5500, 5520):
-            s = socket.socket()
-            try:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(('127.0.0.1', p))
-                s.close()
-                print(p)
-                sys.exit(0)
-            except OSError:
-                continue
-        sys.exit(1)
-        PY
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/python {{ playbook_dir }}/scripts/find_free_port.py 5500 5520"
       register: free_port
       failed_when: free_port.rc != 0
+      args:
+        chdir: "{{ playbook_dir }}"
 
     - name: Set server_port fact from free port
       ansible.builtin.set_fact:
@@ -262,21 +183,8 @@
           ignore_errors: true
 
         - name: Select first responsive port (robust probe)
-          ansible.builtin.shell: |
-            {{ venv_dir }}/bin/python - <<'PY'
-            import socket, sys
-            for p in range(5500, 5570):
-                try:
-                    s = socket.socket()
-                    s.settimeout(0.5)
-                    s.connect(('127.0.0.1', p))
-                    s.close()
-                    print(p)
-                    sys.exit(0)
-                except Exception:
-                    continue
-            sys.exit(1)
-            PY
+          ansible.builtin.command:
+            cmd: "{{ venv_dir }}/bin/python {{ playbook_dir }}/scripts/find_responsive_port.py 5500 5570"
           register: detected_port
           failed_when: detected_port.rc != 0
 
@@ -324,21 +232,8 @@
           args:
             chdir: "{{ playbook_dir }}"
         - name: Choose a new free port for python runner (5500..5569)
-          ansible.builtin.shell: |
-            {{ venv_dir }}/bin/python - <<'PY'
-            import socket, sys
-            for p in range(5500, 5570):
-                s = socket.socket()
-                try:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind(('127.0.0.1', p))
-                    s.close()
-                    print(p)
-                    sys.exit(0)
-                except OSError:
-                    continue
-            sys.exit(1)
-            PY
+          ansible.builtin.command:
+            cmd: "{{ venv_dir }}/bin/python {{ playbook_dir }}/scripts/find_free_port.py 5500 5570"
           register: python_port
           failed_when: python_port.rc != 0
         - name: Set server_port for python runner
