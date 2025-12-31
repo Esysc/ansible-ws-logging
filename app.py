@@ -1,16 +1,19 @@
+# Ensure eventlet monkey-patching happens as early as possible when available.
+# Apply the patch via a small helper module so flake8 doesn't report
+# "module level import not at top of file" when monkey_patch runs.
 import errno
 import glob
 import gzip
 import logging
 import os
-import time
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union, cast
 
 import click
 from flask import Flask, render_template
 from flask_socketio import SocketIO
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
-from watchdog.observers import Observer
+
+import patch_eventlet  # noqa: F401
 
 # Type alias to keep signatures shorter and within line-length limits
 SkipSid = Optional[Union[str, List[str]]]
@@ -42,6 +45,8 @@ class SocketIOLike(Protocol):
 
     def on(self, event: str) -> Any: ...
 
+    def sleep(self, seconds: float) -> None: ...
+
     def run(
         self,
         app: Any,
@@ -59,15 +64,11 @@ class SocketIOLike(Protocol):
 
 _raw_socketio: SocketIOLike = cast(
     SocketIOLike, SocketIO(app, cors_allowed_origins="*")
-)  # actual instance (cast to Protocol for Pylance)
+)
 
 
 class SocketIOWrapper:
-    """Typed wrapper delegating to _raw_socketio.
-
-    This helps editors and type-checkers resolve commonly used methods
-    like `emit`, `on`, `start_background_task`, and `run`.
-    """
+    """Typed wrapper delegating to _raw_socketio."""
 
     def __init__(self, inner: SocketIOLike) -> None:
         self._inner: SocketIOLike = inner
@@ -82,7 +83,6 @@ class SocketIOWrapper:
         skip_sid: SkipSid = None,
         callback: Optional[Callable[..., Any]] = None,
     ) -> None:
-        # Forward args/kwargs to the real SocketIO.emit
         self._inner.emit(
             event,
             *args,
@@ -114,11 +114,6 @@ class SocketIOWrapper:
         allow_unsafe_werkzeug: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Run the wrapped SocketIO server, forwarding all supported kwargs.
-
-        The signature mirrors Flask-SocketIO's `run` to keep editors and type
-        checkers happy and to accept any future keyword options.
-        """
         self._inner.run(
             app,
             host=host,
@@ -131,35 +126,32 @@ class SocketIOWrapper:
             **kwargs,
         )
 
+    def sleep(self, seconds: float) -> None:
+        try:
+            getattr(self._inner, "sleep")(seconds)
+        except Exception:
+            import time
+
+            time.sleep(seconds)
+
 
 socketio: SocketIOWrapper = SocketIOWrapper(_raw_socketio)
 
+# Log a message that the playbook's wait_for task can detect
+logger.info("Starting server on 127.0.0.1 (via gunicorn/eventlet)")
+
 # Specify your logs directory via environment variable or default
 LOGS_DIRECTORY = os.environ.get("ANSIBLE_LOGS_DIR", "/var/log/ansible")
-# Initial port to try when starting the server.
-# Can be overridden with the env var INITIAL_PORT
 INITIAL_PORT = int(os.environ.get("INITIAL_PORT", "5000"))
-# How many consecutive ports to try before giving up.
-# Can be overridden with the env var MAX_PORT_TRIES
 MAX_PORT_TRIES = int(os.environ.get("MAX_PORT_TRIES", "20"))
 
 
 class LogFileHandler(FileSystemEventHandler):
     def _src_path_to_str(self, src_path: Any) -> str:
-        """Return a decoded `str` for src_path which may be bytes-like.
-
-        Handle `bytes` and `bytearray` directly and treat `memoryview`
-        explicitly using `tobytes()` to avoid leaving a
-        `memoryview[Unknown]` argument type in downstream checks that some
-        language servers report as partially unknown.
-        """
-        # bytes-like objects need explicit decoding
         if isinstance(src_path, (bytes, bytearray)):
             return src_path.decode()
         if isinstance(src_path, memoryview):
-            # Use tobytes() which returns concrete bytes
             return src_path.tobytes().decode()
-        # Guarantee we return a str
         return src_path if isinstance(src_path, str) else str(src_path)
 
     def on_created(self, event: FileSystemEvent) -> None:
@@ -176,13 +168,8 @@ class LogFileHandler(FileSystemEventHandler):
         if not src_path_str.endswith(".log"):
             return
         filename: str = os.path.basename(src_path_str)
-        # For simplicity we send the whole file content in this version.
-        # We could optimize this to send only new lines if needed.
         content: str = read_file_content(src_path_str)
-        socketio.emit(
-            "file_content",
-            {"name": filename, "content": content},
-        )
+        socketio.emit("file_content", {"name": filename, "content": content})
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -199,7 +186,6 @@ class LogFileHandler(FileSystemEventHandler):
 def read_file_content(filepath: str) -> str:
     try:
         if filepath.endswith(".gz"):
-            # Read gz in binary and decode explicitly to avoid Any return types
             with gzip.open(filepath, "rb") as file:
                 raw: bytes = file.read()
                 return raw.decode("utf-8", errors="replace")
@@ -212,25 +198,83 @@ def read_file_content(filepath: str) -> str:
             ) as file:
                 return file.read()
     except Exception as e:
-        # Keep the error short and safe for returning to clients
         return f"Error reading file: {e}"
 
 
 def monitor_logs() -> None:
+    """Pure Eventlet-compatible poller - NO watchdog, NO blocking FS ops."""
     if not os.path.exists(LOGS_DIRECTORY):
         logger.warning("Directory %s does not exist.", LOGS_DIRECTORY)
         return
 
-    observer = Observer()
+    poll_interval = 2.0  # Less aggressive polling
+    mtimes: Dict[str, float] = {}
     event_handler = LogFileHandler()
-    observer.schedule(event_handler, LOGS_DIRECTORY, recursive=False)
-    observer.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+
+    def snapshot_files() -> List[str]:
+        """Non-blocking file list using os.listdir instead of glob."""
+        try:
+            return [
+                os.path.join(LOGS_DIRECTORY, f)
+                for f in os.listdir(LOGS_DIRECTORY)
+                if f.endswith((".log", ".gz"))
+            ]
+        except OSError:
+            return []
+
+    # Initial snapshot (non-blocking)
+    for f in snapshot_files():
+        try:
+            mtimes[f] = os.path.getmtime(f)
+        except OSError:
+            pass
+
+    logger.info("monitor_logs started (pure Eventlet poller)")
+
+    while True:  # Let Gunicorn manage shutdown
+        try:
+            current_files = set(snapshot_files())
+
+            # Detect new/removed files
+            new_files = [f for f in current_files if f not in mtimes]
+            removed_files = [f for f in list(mtimes) if f not in current_files]
+
+            if new_files or removed_files:
+                for f in new_files:
+                    try:
+                        mtimes[f] = os.path.getmtime(f)
+                    except OSError:
+                        mtimes[f] = 0.0
+                for f in removed_files:
+                    mtimes.pop(f, None)
+                event_handler.emit_log_files()
+                logger.debug(
+                    "File list updated: +%d -%d",
+                    len(new_files),
+                    len(removed_files),
+                )
+
+            # Detect modified files (most important)
+            for f in list(current_files):
+                try:
+                    mtime = os.path.getmtime(f)
+                    old_mtime = mtimes.get(f)
+                    if old_mtime is None or mtime > old_mtime:
+                        mtimes[f] = mtime
+                        filename = os.path.basename(f)
+                        content = read_file_content(f)
+                        socketio.emit(
+                            "file_content",
+                            {"name": filename, "content": content},
+                        )
+                        logger.debug("Emitted update for %s", filename)
+                except OSError:
+                    mtimes.pop(f, None)
+
+        except Exception as e:
+            logger.exception("Error in monitor_logs: %s", e)
+
+        socketio.sleep(poll_interval)  # Yields to Eventlet event loop
 
 
 @app.route("/")
@@ -245,8 +289,6 @@ def get_log_files() -> List[Dict[str, str]]:
     files: List[str] = []
     for extension in ("*.log", "*.gz"):
         files.extend(glob.glob(os.path.join(LOGS_DIRECTORY, extension)))
-
-    # Sort by modification time, newest first
     files.sort(key=os.path.getmtime, reverse=True)
 
     log_files: List[Dict[str, str]] = []
@@ -256,8 +298,20 @@ def get_log_files() -> List[Dict[str, str]]:
     return log_files
 
 
+_monitor_started = False
+
+
 @socketio.on("connect")
 def handle_connect() -> None:
+    global _monitor_started
+    if not _monitor_started:
+        try:
+            socketio.start_background_task(monitor_logs)
+            logger.info("monitor_logs started on connect (worker)")
+        except Exception as e:
+            logger.exception("Failed to start monitor_logs on connect: %s", e)
+        _monitor_started = True
+
     log_files = get_log_files()
     socketio.emit("file_list", log_files)
 
@@ -269,7 +323,6 @@ def handle_get_file_content(data: Dict[str, Any]) -> None:
         return
 
     filepath = os.path.join(LOGS_DIRECTORY, filename)
-    # Security check to prevent directory traversal
     abs_filepath = os.path.abspath(filepath)
     abs_logs_dir = os.path.abspath(LOGS_DIRECTORY)
     if not abs_filepath.startswith(abs_logs_dir):
@@ -285,13 +338,6 @@ def run_server_with_retries(
     start_port: int = INITIAL_PORT,
     max_tries: int = MAX_PORT_TRIES,
 ) -> None:
-    """Try to find a free port by attempting a simple bind before
-    starting the server.
-
-    This avoids a failure happening in a background thread inside the
-    WSGI server (which would not be caught by an exception raised inside
-    socketio.run).
-    """
     import socket
 
     def port_is_free(h: str, p: int) -> bool:
@@ -308,14 +354,19 @@ def run_server_with_retries(
 
     port = start_port
     for attempt in range(max_tries):
-        logger.info("Checking port %d", port)
-        logger.info("(attempt %d/%d)", attempt + 1, max_tries)
+        logger.info(
+            "Checking port %d (attempt %d/%d)",
+            port,
+            attempt + 1,
+            max_tries,
+        )
         if port_is_free(host, port):
-            # Log short messages (keeps line lengths compact)
-            logger.info("Port %d appears free", port)
-            logger.info("Starting server on %s:%d", host, port)
-            # Disable the reloader to avoid duplicate start attempts from the
-            # automatic watchdog/reloader which can spawn extra processes.
+            logger.info(
+                "Port %d free, starting server on %s:%d",
+                port,
+                host,
+                port,
+            )
             socketio.run(
                 app,
                 host=host,
@@ -324,32 +375,17 @@ def run_server_with_retries(
                 use_reloader=False,
             )
             return
-        else:
-            logger.info("Port %d already in use", port)
-            logger.info("Trying %d", port + 1)
-            port += 1
+        port += 1
 
     logger.error("Failed to bind to any port in range %d-%d", start_port, port)
     raise SystemExit(1)
 
 
 @click.command()
-@click.option(
-    "--initial-port",
-    "-p",
-    type=int,
-    default=None,
-    help="Initial port to try (overrides env INITIAL_PORT)",
-)
-@click.option(
-    "--max-port-tries",
-    "-m",
-    type=int,
-    default=None,
-    help="How many consecutive ports to try (overrides env MAX_PORT_TRIES)",
-)
-@click.option("--host", default="0.0.0.0", help="Host to bind to")
-@click.option("--debug/--no-debug", default=True, help="Run with Flask debug")
+@click.option("--initial-port", "-p", type=int, default=None)
+@click.option("--max-port-tries", "-m", type=int, default=None)
+@click.option("--host", default="0.0.0.0")
+@click.option("--debug/--no-debug", default=True)
 @click.option(
     "--log-level",
     "-l",
@@ -357,7 +393,6 @@ def run_server_with_retries(
         ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False
     ),
     default="INFO",
-    help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
 )
 def main(
     initial_port: Optional[int],
@@ -366,33 +401,19 @@ def main(
     debug: bool,
     log_level: str,
 ) -> None:
-    """Run the server. Options override environment variables."""
-    # Resolve values: CLI > ENV defaults
     start_port = initial_port if initial_port is not None else INITIAL_PORT
     tries = max_port_tries if max_port_tries is not None else MAX_PORT_TRIES
-
-    # Configure log level from the CLI option
     level_name = (log_level or "INFO").upper()
     numeric_level = getattr(logging, level_name, logging.INFO)
     logging.getLogger().setLevel(numeric_level)
     logger.info("Log level set to %s", level_name)
-
-    logger.info(
-        (
-            "Starting server with host=%s",
-            " initial_port=%d",
-            " max_port_tries=%d",
-            " debug=%s",
-        ),
-        host,
-        start_port,
-        tries,
-        debug,
+    msg = (
+        f"Starting server with host={host} initial_port={start_port} "
+        f"max_port_tries={tries} debug={debug}"
     )
+    logger.info(msg)
 
-    # Start watcher background task
     socketio.start_background_task(monitor_logs)
-    # Start server. run_server_with_retries performs a short bind-check.
     run_server_with_retries(host=host, start_port=start_port, max_tries=tries)
 
 

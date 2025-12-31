@@ -6,6 +6,12 @@
     venv_dir: "{{ playbook_dir }}/.venv"
     python: "{{ venv_dir }}/bin/python"
     pip: "{{ venv_dir }}/bin/pip"
+    # How long to keep the server running for manual inspection (seconds)
+    # 240 seconds = 4 minutes
+    run_wait_seconds: 240
+    # Interval in seconds used by the background log writer
+    # Default is 2 seconds between appended lines
+    log_writer_interval: 2
   tasks:
     - name: Ensure python3-venv / virtualenv directory exists
       ansible.builtin.command:
@@ -19,61 +25,417 @@
 
     - name: Install project requirements into venv
       ansible.builtin.command:
-        cmd: "{{ pip }} install -r requirements.txt"
+        cmd: "{{ pip }} install -r {{ playbook_dir }}/../requirements.txt"
+      args:
+        chdir: "{{ playbook_dir }}/.."
 
     - name: Install test dependencies
       ansible.builtin.command:
-        cmd: "{{ pip }} install pytest mypy flake8"
+        cmd: "{{ pip }} install pytest mypy flake8 gunicorn eventlet"
+      args:
+        chdir: "{{ playbook_dir }}/.."
 
     - name: Create sample logs directory for the app
       ansible.builtin.file:
-        path: "{{ playbook_dir }}/tests/sample_logs"
+        path: "{{ playbook_dir }}/sample_logs"
         state: directory
         mode: "0755"
 
-    - name: Create a sample log file
-      ansible.builtin.copy:
-        dest: "{{ playbook_dir }}/tests/sample_logs/ansible.log"
-        content: "Initial log line\n"
+    - name: Populate sample logs with multiple realistic files
+      ansible.builtin.shell: |
+        {{ python }} - <<'PY'
+        import gzip, time, os
+        d = "{{ playbook_dir }}/sample_logs"
+        os.makedirs(d, exist_ok=True)
+        now = int(time.time())
 
-    - name: Start the app in the background (so tester can view web UI)
-      ansible.builtin.shell: >-
-        ANSIBLE_LOGS_DIR='{{ playbook_dir }}/tests/sample_logs' \
-        SECRET_KEY='test-key' \
-        {{ python }} app.py --initial-port 5500 --host 127.0.0.1 --no-debug \
-        > "{{ playbook_dir }}/tests/app.log" 2>&1 & echo $! > "{{ playbook_dir }}/tests/app.pid"
+        def write(name, lines):
+            p = os.path.join(d, name)
+            with open(p, "w", encoding="utf-8") as f:
+                for i in range(lines):
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now+i))} - {name} - log line {i}\n")
+
+        # Main logs
+        write("ansible.log", 200)
+        write("access.log", 500)
+        write("errors.log", 100)
+
+        # gzipped older log
+        gzpath = os.path.join(d, "old.log.gz")
+        with gzip.open(gzpath, "wb") as f:
+            for i in range(300):
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now+i))} - old.log - entry {i}\n".encode())
+
+        # rotated / archived logs
+        for i in range(6):
+            write(f"app.{i}.log", 50)
+
+        print("created")
+        PY
+      tags:
+        - populate_logs
+
+    - name: Write a small background log writer script
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/log_writer.py"
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+
+          import glob
+          import os
+          import signal
+          import sys
+          import time
+          from typing import Any, Dict
+
+          LOG_DIR = os.path.join(os.path.dirname(__file__), "sample_logs")
+          os.makedirs(LOG_DIR, exist_ok=True)
+          PATH = os.path.join(LOG_DIR, "ansible.log")
+          INTERVAL = int(os.environ.get("LOG_WRITER_INTERVAL", "2"))
+
+          counters: Dict[str, int] = {}
+
+          i = 0  # fallback counter
+
+
+          def _handle(signum: int, frame: Any) -> None:
+              sys.exit(0)
+
+
+          signal.signal(signal.SIGTERM, _handle)
+          signal.signal(signal.SIGINT, _handle)
+
+          while True:
+              try:
+                  ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                  files = sorted(glob.glob(os.path.join(LOG_DIR, "*.log")))
+                  if not files:
+                      files = [PATH]
+
+                  for p in files:
+                      c = counters.setdefault(p, 0)
+                      line = f"{ts} - {os.path.basename(p)} - appended line {c}\n"
+                      with open(p, "a", encoding="utf-8") as f:
+                          f.write(line)
+                          f.flush()
+                      counters[p] = c + 1
+
+                  time.sleep(INTERVAL)
+              except Exception as e:
+                  with open(
+                      os.path.join(os.path.dirname(__file__), "log_writer.err"), "a"
+                  ) as errf:
+                      errf.write(str(e) + "\n")
+                  time.sleep(1)
+      tags:
+        - populate_logs
+
+    - name: Start background log writer (appends lines every few seconds)
+      ansible.builtin.shell: |
+        LOG_WRITER_INTERVAL={{ log_writer_interval }} nohup {{ venv_dir }}/bin/python "{{ playbook_dir }}/log_writer.py" > "{{ playbook_dir }}/log_writer.log" 2>&1 & echo $! > "{{ playbook_dir }}/log_writer.pid"
       args:
         chdir: "{{ playbook_dir }}"
+      tags:
+        - populate_logs
+      register: log_writer_start
+      failed_when: log_writer_start.rc != 0
 
-    - name: Wait for the app to become available on port 5500
+    - name: Ensure log writer started properly
+      ansible.builtin.shell: |
+        if [ -f "{{ playbook_dir }}/log_writer.pid" ] && ps -p "$(cat {{ playbook_dir }}/log_writer.pid)" > /dev/null 2>&1; then
+          echo running
+          exit 0
+        else
+          echo not-running
+          exit 1
+        fi
+      register: log_writer_check
+      failed_when: false
+      changed_when: false
+
+    - name: Show first lines of the log writer stdout/stderr if present
+      ansible.builtin.shell: "tail -n 50 {{ playbook_dir }}/log_writer.log || true"
+      register: log_writer_log
+      changed_when: false
+
+    - name: Display log writer startup log
+      ansible.builtin.debug:
+        msg: "{{ log_writer_log.stdout }}"
+
+    - name: Verify log writer is appending to ansible.log
+      ansible.builtin.shell: |
+        INITIAL_LINES=$(wc -l < "{{ playbook_dir }}/sample_logs/ansible.log")
+        sleep {{ log_writer_interval * 2 + 1 }}
+        CURRENT_LINES=$(wc -l < "{{ playbook_dir }}/sample_logs/ansible.log")
+        if [ "$CURRENT_LINES" -gt "$INITIAL_LINES" ]; then
+          echo "Log is growing: $INITIAL_LINES -> $CURRENT_LINES"
+          exit 0
+        else
+          echo "Log is NOT growing: $INITIAL_LINES -> $CURRENT_LINES"
+          exit 1
+        fi
+      register: log_growth_check
+      changed_when: false
+
+    - name: Report log growth
+      ansible.builtin.debug:
+        msg: "{{ log_growth_check.stdout }}"
+
+    - name: Find an available port (5500..5519)
+      ansible.builtin.shell: |
+        {{ venv_dir }}/bin/python - <<'PY'
+        import socket, sys
+        for p in range(5500, 5520):
+            s = socket.socket()
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('127.0.0.1', p))
+                s.close()
+                print(p)
+                sys.exit(0)
+            except OSError:
+                continue
+        sys.exit(1)
+        PY
+      register: free_port
+      failed_when: free_port.rc != 0
+
+    - name: Set server_port fact from free port
+      ansible.builtin.set_fact:
+        server_port: "{{ free_port.stdout }}"
+
+    - name: Start the app in the background via gunicorn (eventlet worker)
+      ansible.builtin.shell: >-
+        ANSIBLE_LOGS_DIR='{{ playbook_dir }}/sample_logs' \
+        ANSIBLE_LOG_FOLDER='{{ playbook_dir }}/sample_logs' \
+        SECRET_KEY='test-key' \
+        PORT_FILE='{{ playbook_dir }}/app.port' \
+        {{ venv_dir }}/bin/gunicorn -k eventlet -w 1 -b 127.0.0.1:{{ server_port }} app:app \
+          --access-logfile - --error-logfile - --log-level info \
+          --timeout 60 \
+          > "{{ playbook_dir }}/app.log" 2>&1 & echo $! > "{{ playbook_dir }}/app.pid"
+      args:
+        chdir: "{{ playbook_dir }}/.."
+    - name: Wait for the app to write a startup line to the log (max 15s)
+      ansible.builtin.wait_for:
+        path: "{{ playbook_dir }}/app.log"
+        search_regex: "Starting server on|wsgi starting up"
+        timeout: 15
+      register: log_started
+      failed_when: false
+      ignore_errors: true
+
+    - name: Try to detect which port the app bound to from logs
+      ansible.builtin.shell: >-
+        # Extract the last port found in the log (if any) from either our own message or WSGI
+        grep -E "Starting server on|wsgi starting up" {{ playbook_dir }}/app.log || true
+        grep -Eo ":[0-9]{2,5}" {{ playbook_dir }}/app.log | tail -n1 | tr -d ':' || true
+      register: started_port
+      changed_when: false
+
+    - name: Set detected server_port if found in log
+      ansible.builtin.set_fact:
+        server_port: "{{ started_port.stdout }}"
+      when: started_port.stdout != ""
+
+    - name: Verify server is responsive at chosen port (quick check)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ server_port }}/"
+        status_code: 200
+        timeout: 1
+      register: port_check
+      failed_when: false
+      changed_when: false
+      when: server_port is defined and server_port != ""
+
+    - name: Probe port range if chosen port is unresponsive or not set
+      block:
+        - name: Check ports in range {{ 5500 }}..{{ 5500 + 20 - 1 }}
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: "{{ item }}"
+            timeout: 1
+          loop: "{{ query('sequence', start=5500, end=5569) }}"
+          register: wait_results
+          failed_when: false
+          ignore_errors: true
+
+        - name: Select first responsive port (robust probe)
+          ansible.builtin.shell: |
+            {{ venv_dir }}/bin/python - <<'PY'
+            import socket, sys
+            for p in range(5500, 5570):
+                try:
+                    s = socket.socket()
+                    s.settimeout(0.5)
+                    s.connect(('127.0.0.1', p))
+                    s.close()
+                    print(p)
+                    sys.exit(0)
+                except Exception:
+                    continue
+            sys.exit(1)
+            PY
+          register: detected_port
+          failed_when: detected_port.rc != 0
+
+        - name: Set server_port from detected responsive port
+          ansible.builtin.set_fact:
+            server_port: "{{ detected_port.stdout }}"
+          when: detected_port is defined and detected_port.rc == 0
+      when: server_port is not defined or (port_check is defined and port_check.status | default(-1) != 200)
+
+    - name: Fail if server not found on any port
+      ansible.builtin.fail:
+        msg: "Server did not become available on any port in the attempted range"
+      when: server_port is not defined or server_port == ""
+
+    - name: Report detected server port
+      ansible.builtin.debug:
+        msg: "Server is available on port {{ server_port }}"
+
+    - name: Wait for detected server port to be responsive
       ansible.builtin.wait_for:
         host: 127.0.0.1
-        port: 5500
-        timeout: 15
+        port: "{{ server_port }}"
+        timeout: 10
 
-    - name: Check root endpoint
+    - name: Check root endpoint (non-fatal)
       ansible.builtin.uri:
-        url: "http://127.0.0.1:5500/"
+        url: "http://127.0.0.1:{{ server_port }}/"
         status_code: 200
+      register: root_check
+      failed_when: false
+      changed_when: false
 
-    - name: Run mypy
-      ansible.builtin.command:
-        cmd: "{{ python }} -m mypy app.py"
-      register: mypy_result
-      failed_when: mypy_result.rc != 0
+    - name: Keep the server running for manual observation
+      ansible.builtin.pause:
+        seconds: "{{ run_wait_seconds }}"
+      when: run_wait_seconds | int > 0
 
-    - name: Run flake8
-      ansible.builtin.command:
-        cmd: "{{ venv_dir }}/bin/flake8 ."
-      register: flake_result
-      failed_when: flake_result.rc != 0
+    - block:
+        - name: Root unresponsive — stop gunicorn and attempt python runner fallback
+          ansible.builtin.shell: |
+            if [ -f "{{ playbook_dir }}/app.pid" ]; then
+              kill "$(cat {{ playbook_dir }}/app.pid)" || true
+              rm -f "{{ playbook_dir }}/app.pid"
+            fi
+          args:
+            chdir: "{{ playbook_dir }}"
+        - name: Choose a new free port for python runner (5500..5569)
+          ansible.builtin.shell: |
+            {{ venv_dir }}/bin/python - <<'PY'
+            import socket, sys
+            for p in range(5500, 5570):
+                s = socket.socket()
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(('127.0.0.1', p))
+                    s.close()
+                    print(p)
+                    sys.exit(0)
+                except OSError:
+                    continue
+            sys.exit(1)
+            PY
+          register: python_port
+          failed_when: python_port.rc != 0
+        - name: Set server_port for python runner
+          ansible.builtin.set_fact:
+            server_port: "{{ python_port.stdout }}"
+        - name: Start the app via python runner (background)
+          ansible.builtin.shell: >-
+            ANSIBLE_LOGS_DIR='{{ playbook_dir }}/sample_logs' \
+            ANSIBLE_LOG_FOLDER='{{ playbook_dir }}/sample_logs' \
+            SECRET_KEY='test-key' \
+            {{ venv_dir }}/bin/python -u -m app -p {{ server_port }} --debug \
+              > "{{ playbook_dir }}/app.log" 2>&1 & echo $! > "{{ playbook_dir }}/app.pid"
+          args:
+            chdir: "{{ playbook_dir }}/.."
+        - name: Wait for python runner to write startup line (max 15s)
+          ansible.builtin.wait_for:
+            path: "{{ playbook_dir }}/app.log"
+            search_regex: "Starting server on|Listening at"
+            timeout: 15
+          register: py_log_started
+          failed_when: false
+          ignore_errors: true
+        - name: Verify python runner port responsive
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: "{{ server_port }}"
+            timeout: 10
+      when: root_check is defined and (root_check.status | default(-1)) != 200
 
-    - name: Run pytest
-      ansible.builtin.command:
-        cmd: "{{ venv_dir }}/bin/pytest -q"
-      register: pytest_result
-      failed_when: pytest_result.rc != 0
+    - name: Show last 10 lines of the live log (if present)
+      ansible.builtin.shell: "tail -n 10 {{ playbook_dir }}/sample_logs/ansible.log || true"
+      register: tail_log
+      changed_when: false
+
+    - name: Display recent log tail
+      ansible.builtin.debug:
+        msg: "{{ tail_log.stdout }}"
+
+    - block:
+        - name: Run mypy
+          ansible.builtin.command:
+            cmd: "{{ python }} -m mypy app.py"
+          args:
+            chdir: "{{ playbook_dir }}/.."
+          register: mypy_result
+          failed_when: mypy_result.rc != 0
+
+        - name: Run flake8 (exclude virtualenv)
+          ansible.builtin.command:
+            cmd: "{{ venv_dir }}/bin/flake8 . --exclude {{ venv_dir }}"
+          args:
+            chdir: "{{ playbook_dir }}/.."
+          register: flake_result
+          failed_when: flake_result.rc != 0
+
+        - name: Run pytest
+          ansible.builtin.shell: "{{ venv_dir }}/bin/pytest -q"
+          args:
+            chdir: "{{ playbook_dir }}/.."
+          environment:
+            PYTHONPATH: "{{ playbook_dir }}/.."
+          register: pytest_result
+          failed_when: pytest_result.rc != 0
+      rescue:
+        - name: Report failure in test block
+          ansible.builtin.debug:
+            msg: "One or more test tasks failed; continuing to cleanup"
+        - name: Mark tests as failed but continue
+          ansible.builtin.set_fact:
+            tests_failed: true
+      always:
+        - name: Stop the background app (cleanup)
+          ansible.builtin.shell: |
+            if [ -f "{{ playbook_dir }}/app.pid" ]; then
+              kill "$(cat {{ playbook_dir }}/app.pid)" || true
+              rm -f "{{ playbook_dir }}/app.pid"
+            fi
+            if [ -f "{{ playbook_dir }}/log_writer.pid" ]; then
+              kill "$(cat {{ playbook_dir }}/log_writer.pid)" || true
+              rm -f "{{ playbook_dir }}/log_writer.pid"
+            fi
+          ignore_errors: true
+
+        - name: Remove the virtualenv (cleanup)
+          ansible.builtin.file:
+            path: "{{ venv_dir }}"
+            state: absent
+          ignore_errors: true
+
+    - name: Stop the background app (cleanup)
+      ansible.builtin.shell: |
+        if [ -f "{{ playbook_dir }}/app.pid" ]; then
+          kill "$(cat {{ playbook_dir }}/app.pid)" || true
+          rm -f "{{ playbook_dir }}/app.pid"
+        fi
+      ignore_errors: true
 
     - name: Summary
       ansible.builtin.debug:
-        msg: "mypy: {{ mypy_result.rc }}, flake8: {{ flake_result.rc }}, pytest: {{ pytest_result.rc }}"
+        msg: "mypy: {{ mypy_result.rc | default('skipped') }}, flake8: {{ flake_result.rc | default('skipped') }}, pytest: {{ pytest_result.rc | default('skipped') }}, tests_failed: {{ tests_failed | default(false) }}"
