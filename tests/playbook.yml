@@ -1,0 +1,79 @@
+- name: Run project tests locally
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    venv_dir: "{{ playbook_dir }}/.venv"
+    python: "{{ venv_dir }}/bin/python"
+    pip: "{{ venv_dir }}/bin/pip"
+  tasks:
+    - name: Ensure python3-venv / virtualenv directory exists
+      ansible.builtin.command:
+        cmd: python3 -m venv "{{ venv_dir }}"
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+
+    - name: Upgrade pip in venv
+      ansible.builtin.command:
+        cmd: "{{ pip }} install --upgrade pip"
+
+    - name: Install project requirements into venv
+      ansible.builtin.command:
+        cmd: "{{ pip }} install -r requirements.txt"
+
+    - name: Install test dependencies
+      ansible.builtin.command:
+        cmd: "{{ pip }} install pytest mypy flake8"
+
+    - name: Create sample logs directory for the app
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/tests/sample_logs"
+        state: directory
+        mode: "0755"
+
+    - name: Create a sample log file
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/tests/sample_logs/ansible.log"
+        content: "Initial log line\n"
+
+    - name: Start the app in the background (so tester can view web UI)
+      ansible.builtin.shell: >-
+        ANSIBLE_LOGS_DIR='{{ playbook_dir }}/tests/sample_logs' \
+        SECRET_KEY='test-key' \
+        {{ python }} app.py --initial-port 5500 --host 127.0.0.1 --no-debug \
+        > "{{ playbook_dir }}/tests/app.log" 2>&1 & echo $! > "{{ playbook_dir }}/tests/app.pid"
+      args:
+        chdir: "{{ playbook_dir }}"
+
+    - name: Wait for the app to become available on port 5500
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 5500
+        timeout: 15
+
+    - name: Check root endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:5500/"
+        status_code: 200
+
+    - name: Run mypy
+      ansible.builtin.command:
+        cmd: "{{ python }} -m mypy app.py"
+      register: mypy_result
+      failed_when: mypy_result.rc != 0
+
+    - name: Run flake8
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/flake8 ."
+      register: flake_result
+      failed_when: flake_result.rc != 0
+
+    - name: Run pytest
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/pytest -q"
+      register: pytest_result
+      failed_when: pytest_result.rc != 0
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "mypy: {{ mypy_result.rc }}, flake8: {{ flake_result.rc }}, pytest: {{ pytest_result.rc }}"
