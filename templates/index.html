@@ -61,6 +61,39 @@
             gap: 10px;
             margin-bottom: 15px;
         }
+        /* Small blue dot to indicate an updated file */
+        .update-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: #0d6efd; /* Bootstrap primary */
+            margin-right: 8px;
+            flex-shrink: 0;
+            visibility: hidden;
+            opacity: 1;
+            transform-origin: center;
+        }
+
+        /* Pulse animation for slow blinking */
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+                transform: scale(1);
+            }
+            50% {
+                opacity: 0.25;
+                transform: scale(1.15);
+            }
+            100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+        }
+
+        .update-dot.blink {
+            visibility: visible;
+            animation: pulse 2.5s ease-in-out infinite;
+        }
     </style>
 </head>
 <body>
@@ -105,24 +138,45 @@
 
         let currentFilename = '';
         let fullContent = '';
+        const updatedFiles = new Set();
 
         socket.on('file_list', (files) => {
             fileList.innerHTML = '';
             files.forEach(file => {
                 const item = document.createElement('a');
                 item.className = 'list-group-item list-group-item-action';
+                item.dataset.filename = file.name;
                 if (file.name === currentFilename) item.classList.add('active-file');
 
-                item.innerHTML = `
-                    <span>${file.name}</span>
-                    <i class="bi bi-file-text"></i>
-                `;
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = file.name;
+
+                const dot = document.createElement('span');
+                dot.className = 'update-dot';
+
+                const icon = document.createElement('i');
+                icon.className = 'bi bi-file-text';
+
+                // Left container holds dot + filename to place dot on the left
+                const left = document.createElement('div');
+                left.style.display = 'flex';
+                left.style.alignItems = 'center';
+                left.appendChild(dot);
+                left.appendChild(nameSpan);
+
+                item.appendChild(left);
+                item.appendChild(icon);
 
                 item.onclick = () => {
                     document.querySelectorAll('.list-group-item').forEach(el => el.classList.remove('active-file'));
                     item.classList.add('active-file');
+                    // When user opens the file, clear the updated indicator
+                    updatedFiles.delete(file.name);
+                    dot.classList.remove('blink');
                     selectFile(file.name);
                 };
+                // Show dot if we already marked this file as updated
+                if (updatedFiles.has(file.name)) dot.classList.add('blink');
                 fileList.appendChild(item);
             });
         });
@@ -134,10 +188,28 @@
         }
 
         socket.on('file_content', (data) => {
+            // If it's the current file we're viewing, update display.
             if (data.name === currentFilename) {
                 fullContent = data.content;
                 updateDisplay();
                 loading.style.display = 'none';
+                // Ensure indicator for this file is cleared
+                updatedFiles.delete(data.name);
+                const curItem = Array.from(document.querySelectorAll('.list-group-item'))
+                    .find(el => el.dataset.filename === data.name);
+                if (curItem) {
+                    const dot = curItem.querySelector('.update-dot');
+                    if (dot) dot.classList.remove('blink');
+                }
+            } else {
+                // Mark other files as updated (show blue dot)
+                updatedFiles.add(data.name);
+                const item = Array.from(document.querySelectorAll('.list-group-item'))
+                    .find(el => el.dataset.filename === data.name);
+                if (item) {
+                    const dot = item.querySelector('.update-dot');
+                    if (dot) dot.classList.add('blink');
+                }
             }
         });
 
