@@ -29,9 +29,9 @@
       args:
         chdir: "{{ playbook_dir }}/.."
 
-    - name: Install test dependencies
+    - name: Install test dependencies (from requirements.txt)
       ansible.builtin.command:
-        cmd: "{{ pip }} install pytest mypy flake8 gunicorn eventlet"
+        cmd: "{{ pip }} install -r {{ playbook_dir }}/../requirements.txt"
       args:
         chdir: "{{ playbook_dir }}/.."
 
