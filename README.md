@@ -149,8 +149,3 @@ pre-commit run ruff --all-files
 
 If you prefer to use the markdown linter directly, you can also
 install `markdownlint-cli` (node) or use the Docker image.
-
----
-
-If you'd like, I can also add a short note to the top of the app
-or a `--help` printout that reports the selected port on startup.
